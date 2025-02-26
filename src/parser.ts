@@ -9,6 +9,8 @@ import { File } from '@babel/types';
 export class Parser {
   entryFile: string;
   tree: Tree | undefined;
+  tsconfig: any;
+  basePath: string;
 
   constructor(filePath: string) {
     // Fix when selecting files in wsl file system
@@ -31,7 +33,100 @@ export class Parser {
     }
 
     this.tree = undefined;
-    // Break down and reasemble given filePath safely for any OS using path?
+    this.basePath = path.dirname(this.entryFile);
+    // Try to load tsconfig.json
+    this.tsconfig = this.loadTsConfig();
+  }
+
+  // Load and parse tsconfig.json to extract path mappings
+  private loadTsConfig(): any {
+    try {
+      let currentDir = this.basePath;
+      const root = path.parse(currentDir).root;
+      
+      while (currentDir !== root) {
+        const tsconfigPath = path.join(currentDir, 'tsconfig.json');
+  
+        if (fs.existsSync(tsconfigPath)) {
+          try {
+            const content = fs.readFileSync(tsconfigPath, 'utf8');
+            const config = JSON.parse(content);
+            this.basePath = currentDir; // Set basePath to the directory containing tsconfig
+            return config;
+          } catch (jsonError) {
+            console.error('Error parsing tsconfig.json:', jsonError);
+          }
+        }
+        currentDir = path.dirname(currentDir);
+      }
+    } catch (err) {
+      console.error('Error loading tsconfig.json:', err);
+    }
+    return null;
+  }
+
+  // Resolve path considering tsconfig path aliases
+  private resolveImportPath(importPath: string, currentFilePath: string): string {
+    // If it's a relative import or absolute path, resolve normally
+    if (importPath.startsWith('.') || importPath.startsWith('/') || importPath.startsWith('\\')) {
+      const resolvedPath = path.resolve(path.dirname(currentFilePath), importPath);
+      return resolvedPath;
+    }
+    
+    // If we have tsconfig with path mappings
+    if (this.tsconfig?.compilerOptions?.paths) {
+      const paths = this.tsconfig.compilerOptions.paths;
+      const baseUrl = this.tsconfig.compilerOptions.baseUrl || '.';
+      
+      // Check each alias pattern
+      for (const [pattern, destinations] of Object.entries(paths)) {
+        // Convert pattern to regex (e.g., "@components/*" -> /^@components\/(.*)$/)
+        const regexPattern = new RegExp(
+          `^${pattern.replace(/\*/g, '(.*)')}$`
+        );
+        const match = importPath.match(regexPattern);
+        if (match) {
+          // Get the wildcard part if any
+          const wildcard = match[1] || '';
+
+          // Try each possible destination
+          for (const destination of destinations as string[]) {
+            const resolvedPath = path.join(
+              this.basePath,
+              baseUrl,
+              destination.replace(/\*/g, wildcard)
+            );
+            
+            // Check if file exists (with various extensions)
+            const possibleExtensions = ['.ts', '.tsx', '.js', '.jsx'];
+            for (const ext of possibleExtensions) {
+              const fullPath = resolvedPath + ext;
+              if (fs.existsSync(fullPath)) {
+                return fullPath;
+              }
+            }
+            
+            // If no extension, maybe it's a directory with index file
+            for (const ext of possibleExtensions) {
+              const indexPath = path.join(resolvedPath, `index${ext}`);
+              if (fs.existsSync(indexPath)) {
+                return indexPath;
+              }
+            }
+            
+            // If no specific file found but directory exists, return path to it
+            if (fs.existsSync(resolvedPath) && 
+                fs.lstatSync(resolvedPath).isDirectory()) {
+              return resolvedPath;
+            }
+          }
+        }
+      }
+    }
+    
+    // If no path mapping found, return the original import path
+    const defaultPath = path.resolve(path.dirname(currentFilePath), importPath);
+    return defaultPath;
   }
 
   // Public method to generate component tree based on current entryFile
@@ -142,7 +237,7 @@ export class Parser {
   // Recursively builds the React component tree structure starting from root node
   private parser(componentTree: Tree): Tree | undefined {
     // If import is a node module, do not parse any deeper
-    if (!['\\', '/', '.'].includes(componentTree.importPath[0])) {
+    if (!['\\', '/', '.'].includes(componentTree.importPath[0]) && !(componentTree.importPath.startsWith('ambition/') && componentTree.importPath.includes('pipeline'))) {
       componentTree.thirdParty = true;
       if (
         componentTree.fileName === 'react-router-dom' ||
@@ -151,10 +246,12 @@ export class Parser {
         componentTree.reactRouter = true;
       }
       return;
-    }
+    } 
 
     // Check that file has valid fileName/Path, if not found, add error to node and halt
+    console.log('componentTree', componentTree);
     const fileName = this.getFileName(componentTree);
+    console.log('fileName', fileName);
     if (!fileName) {
       componentTree.error = 'File not found.';
       return;
@@ -192,6 +289,8 @@ export class Parser {
         componentTree
       );
     }
+
+    console.log('children', componentTree.children);
 
     // Check if current node is connected to the Redux store
     if (ast.tokens) {
@@ -340,15 +439,15 @@ export class Parser {
         ...props,
       };
     } else {
-      // Add tree node to childNodes if one does not exist
+      // Use the new resolveImportPath method to handle aliases
+      const importPath = imports[astToken.value]['importPath'];
+      const resolvedPath = this.resolveImportPath(importPath, parent.filePath);
+      
       children[astToken.value] = {
         id: getNonce(),
         name: imports[astToken.value]['importName'],
         fileName: path.basename(imports[astToken.value]['importPath']),
-        filePath: path.resolve(
-          path.dirname(parent.filePath),
-          imports[astToken.value]['importPath']
-        ),
+        filePath: resolvedPath,
         importPath: imports[astToken.value]['importPath'],
         expanded: false,
         depth: parent.depth + 1,
